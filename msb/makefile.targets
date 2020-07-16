@@ -1,0 +1,6 @@
+# Static libraries that are linked but might first need to be built 
+googletest.a:
+	make clean -C ../submodules/googletest/googletest/make
+	make -C ../submodules/googletest/googletest/make
+	cp ../submodules/googletest/googletest/make/gtest_main.a googletest.a
+	make clean -C ../submodules/googletest/googletest/make
