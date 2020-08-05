@@ -30,7 +30,7 @@ find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
 	pkg_search_module(OPENSSL REQUIRED openssl)
 else()
-	find_package(openssl REQUIRED)
+	find_package(OpenSSL REQUIRED)
 endif(PkgConfig_FOUND)
 
 include_directories(${OPENSSL_INCLUDE_DIR})
@@ -66,12 +66,12 @@ add_subdirectory(external/googletest)
 include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
 
  
-# Request that project is built with --std=c++11
+# Request that project is built with --std=c++14
 # As this is a public compile feature anything that links to 
-# particles will also build with -std=c++11
-#target_compile_features(cuda-lib PUBLIC cxx_std_11)
+# particles will also build with -std=c++14
+#target_compile_features(cuda-lib PUBLIC cxx_std_14)
 
-#set (CMAKE_CXX_STANDARD 11)
+#set (CMAKE_CXX_STANDARD 14)
  
 # We need to explicitly state that we need all CUDA files in the 
 # particle library to be built with -dc as the member functions 
@@ -80,7 +80,7 @@ include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
 #						PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
  
 add_executable(cuda-lib ${SOURCES})
-target_compile_features(cuda-lib PUBLIC cxx_std_11)
+target_compile_features(cuda-lib PUBLIC cxx_std_14)
 target_link_libraries(cuda-lib ${OPENSSL_LIBRARIES})
 target_link_libraries(cuda-lib gtest)
 target_link_libraries(cuda-lib curand)
