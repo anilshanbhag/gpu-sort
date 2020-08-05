@@ -606,30 +606,30 @@ template <typename KeyT>
 void rdxsrt_unstable_sort_keys(KeyT *keys, const unsigned long long int key_count, KeyT *sorted_keys_out)
 {
 	/*** KEY ALLOCATION ***/
-	//BM_START_CUDA_EVENT(memcpy H2D, memcpyhtd,NULL);
+	BM_START_CUDA_EVENT(memcpy H2D, memcpyhtd,NULL);
 	KeyT *dev_keys, *dev_keys_out;
 	// Allocate device memory for the sorted keys
 	cudaMalloc((void **)&dev_keys_out, sizeof(*dev_keys_out) * key_count);
 	// Allocate device memory for the input keys and copy keys there
 	cudaMalloc((void **)&dev_keys, sizeof(*dev_keys) * key_count);
 	cudaMemcpy(dev_keys, keys, sizeof(*dev_keys) * key_count, cudaMemcpyHostToDevice);
-	//BM_STOP_CUDA_EVENT(memcpy H2D, memcpyhtd, NULL);
+	BM_STOP_CUDA_EVENT(memcpy H2D, memcpyhtd, NULL);
 
 	/*** Trigger key sorting according to the most significant byte ***/
 	//START_CUDA_TIMER(1, bm_whole, NULL);
-	//BM_START_CUDA_EVENT(full sort, full_sort, NULL);
+	BM_START_CUDA_EVENT(full sort, full_sort, NULL);
 //	if(key_count>UINT_MAX)
 //		rdxsrt_unstable_sort<KeyT, KeyT, unsigned long long int>(dev_keys, NULL, key_count, dev_keys_out, NULL);
 //	else
 		rdxsrt_unstable_sort<KeyT, cub::NullType, unsigned int>(dev_keys, NULL, key_count, dev_keys_out, NULL);
-	//BM_STOP_CUDA_EVENT(full sort, full_sort, NULL);
+	BM_STOP_CUDA_EVENT(full sort, full_sort, NULL);
 	//STOP_CUDA_TIMER(bm_whole, "Whole radix sort...");
 
 	/*** Copy back sorted keys ***/
-	//BM_START_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
+	BM_START_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
 	cudaMemcpy(sorted_keys_out, dev_keys, sizeof(*dev_keys) * key_count, cudaMemcpyDeviceToHost);
-	//BM_STOP_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
-
+	BM_STOP_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
+ 
 	/*** Free memory ***/
 	cudaFree(dev_keys);
 	cudaFree(dev_keys_out);
@@ -640,7 +640,7 @@ void rdxsrt_unstable_sort_pairs(KeyT *keys, ValueT *values, const unsigned long 
 {
 	// Start performance measurement
 	/*** KEY ALLOCATION ***/
-	//BM_START_CUDA_EVENT(memcpy H2D, memcpyhtd,NULL);
+	BM_START_CUDA_EVENT(memcpy H2D, memcpyhtd,NULL);
 	KeyT *dev_keys, *dev_keys_out;
 	// Allocate device memory for the sorted keys
 	cudaMalloc((void **)&dev_keys_out, sizeof(*dev_keys_out) * key_count);
@@ -656,23 +656,23 @@ void rdxsrt_unstable_sort_pairs(KeyT *keys, ValueT *values, const unsigned long 
 	// Allocate device memory for the input keys and copy keys there
 	cudaMalloc((void **)&dev_values, sizeof(*dev_values) * key_count);
 	cudaMemcpy(dev_values, values, sizeof(*dev_values) * key_count, cudaMemcpyHostToDevice);
-	//BM_STOP_CUDA_EVENT(memcpy H2D, memcpyhtd, NULL);
+	BM_STOP_CUDA_EVENT(memcpy H2D, memcpyhtd, NULL);
 	/*** VALUE ALLOCATION ***/
 
 	/*** Trigger key sorting according to the most significant byte ***/
 	//START_CUDA_TIMER(1, bm_whole, NULL);
-	//BM_START_CUDA_EVENT(full sort, full_sort, NULL);
+	BM_START_CUDA_EVENT(full sort, full_sort, NULL);
 	rdxsrt_unstable_sort<KeyT, ValueT, unsigned int>(dev_keys, dev_values, key_count, dev_keys_out, dev_values_out, local_sort_config_set);
-	//BM_STOP_CUDA_EVENT(full sort, full_sort, NULL);
+	BM_STOP_CUDA_EVENT(full sort, full_sort, NULL);
 	//STOP_CUDA_TIMER(bm_whole, "Whole radix sort...");
 
 	/*** Copy back sorted keys ***/
-	//BM_START_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
+	BM_START_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
 	cudaMemcpy(sorted_keys_out, dev_keys, sizeof(*dev_keys) * key_count, cudaMemcpyDeviceToHost);
 
 	/*** Copy back sorted values ***/
 	cudaMemcpy(sorted_values_out, dev_values, sizeof(*dev_values) * key_count, cudaMemcpyDeviceToHost);
-	//BM_STOP_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
+	BM_STOP_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
 
 	/*** Free memory ***/
 	cudaFree(dev_keys);

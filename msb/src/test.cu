@@ -1,3 +1,6 @@
+// nvcc test.cu sort/*.cu ../external/benchmark/*.cu -O3 -arch=sm_52 -I. -I../external -lcurand
+
+#include "benchmark/benchmark.h"
 #include "sort/gpu_radix_sort.h"
 #include "cub/cub.cuh"
 #include <curand.h>
