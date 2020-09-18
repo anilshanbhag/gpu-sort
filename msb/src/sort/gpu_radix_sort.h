@@ -6,6 +6,8 @@
 #include <assert.h>
 #include "cub/cub.cuh"
 #include "gpu_helper/gpu_helper.cuh"
+#include "benchmark/debug_logger.h"
+#include "benchmark/benchmark.h"
 #include "sort/gpu_sort_config.h"
 #include "sort/cuda_radix_sort_common.h"
 #include "sort/cuda_radix_sort_config.h"
@@ -19,105 +21,8 @@ struct extsrt_assignment_info_t {
 	unsigned int num_extsrt_remainder_block_count;
 	unsigned int extsrt_full_block_offset;
 };
-//void rdxsrt_prepare_histograms(unsigned int *dev_histo, unsigned int num_ext_in_bins, cudaStream_t cstream);
-//struct extsrt_assignment_info_t generate_next_pass_block_assignments(const unsigned int *dev_atomic_extsrt_bucket_counter, const SubBucketInfo *dev_extsrt_in_bin_info, SubBucketInfo *extsrt_in_bin_info,  struct rdxsrt_extsrt_block_to_bin_t *extsrt_blck_to_in_bin_assignments, unsigned int max_ext_srt_kpb, cudaStream_t cstream, cudaEvent_t offst_comp_event);
-
-void rdxsrt_prepare_histograms(unsigned int *dev_histo, unsigned int num_ext_in_bins, cudaStream_t cstream)
-{
-	// For every IN-bin that needs to be sorted externally, we need one histogram with each 256 sub-bins
-	if(num_ext_in_bins>0)
-		cudaMemsetAsync(dev_histo, 0, num_ext_in_bins * 256 * sizeof(*dev_histo), cstream);
-}
-
-/** *
- * Takes as input the number of extsrt OUT-bins of the last pass (dev_atomic_ext_srt_counter), along with info on on their unique index, offset and number of elements (dev_extsrt_in_bin_info),
- * copies the information to extsrt_in_bin_info and computes the block assignments accordingly, writing it to extsrt_blck_to_in_bin_assignments.
- *
- * @param dev_atomic_ext_srt_bin_counter		The number of EXTSRT-OUT-bins from the last pass. Equals the number of EXTSRT-IN-bins of this pass.
- * @param dev_extsrt_in_bin_info				Information about the EXTSRT-OUT-bins from the last pass, such as a unique index (bin_idx), the bin's offset within the *keys array (offset) and the number of keys in that bin (block_num_elements).
- * @param extsrt_in_bin_info					Pointer to host side memory to which dev_extsrt_in_bin_info should be copied to.
- * @param extsrt_blck_to_in_bin_assignments		Pointer to memory to which the block assignments that are computed according to dev_extsrt_in_bin_info should be written to.
- * @param max_ext_srt_kpb						The maximum number of keys each extsrt-block will cover
- * @param cstream								The cuda stream to use for copying the device side information of the EXTSRT-bins to the Host
- * @param offst_comp_event						The event to synchronize with, such that it is guaranteed that the information in dev_atomic_ext_srt_bin_counter and dev_extsrt_in_bin_info is final.
- * @return	Returns the number of EXTSRT-bins and the total number of EXTSRT-blocks required to externally radix-sort the EXTSRT-bins.
- */
-struct extsrt_assignment_info_t generate_next_pass_block_assignments(const unsigned int *dev_atomic_extsrt_bucket_counter, const SubBucketInfo *dev_extsrt_in_bin_info, SubBucketInfo *extsrt_in_bin_info,  struct rdxsrt_extsrt_block_to_bin_t *extsrt_blck_to_in_bin_assignments, unsigned int max_ext_srt_kpb, cudaStream_t cstream, cudaEvent_t offst_comp_event){
-	// Make sure GPU has finished computing the sub-buckets of the last pass
-	cudaEventSynchronize(offst_comp_event);
-
-	// Get number of sub-buckets that require another counting sort
-	unsigned int num_next_pass_ext_buckets;
-	cudaMemcpyAsync(&num_next_pass_ext_buckets, dev_atomic_extsrt_bucket_counter, sizeof(num_next_pass_ext_buckets), cudaMemcpyDeviceToHost, cstream);
-//	printf("Num next pass buckets: %u\n", num_next_pass_ext_buckets);
-	cudaStreamSynchronize(cstream); // TODO think of giving it it's own stream, if that makes sense: look at the dependency - we want to interleave CPU preparation and copy, in best case with local sort
-
-	// Get info (.offset: sub-bucket offset, .block_num_elements: total number of sub-bucket's keys) on the sub-buckets that require another counting sort
-	if(num_next_pass_ext_buckets==0){
-		struct extsrt_assignment_info_t tmp;
-		tmp.num_ext_bins = 0;
-		tmp.num_extsrt_block_count = 0;
-		tmp.num_extsrt_remainder_block_count = 0;
-		tmp.extsrt_full_block_offset = 0;
-		return tmp;
-	}
-	cudaMemcpyAsync(extsrt_in_bin_info, dev_extsrt_in_bin_info, num_next_pass_ext_buckets * sizeof(*extsrt_in_bin_info), cudaMemcpyDeviceToHost, cstream);
-	cudaStreamSynchronize(cstream);
-
-	// Counting the required number of full blocks for the counting sorts of the coming pass
-	unsigned int num_next_pass_ext_block_count = 0;
-	// Counting the required number of remainder blocks (not-full) for the counting sorts of the coming pass
-	unsigned int num_extsrt_remainder_block_count = 0;
-
-	// The first num_next_pass_ext_buckets assignments are reserved for the up to num_next_pass_ext_buckets remainder blocks, such that in memory we have:
-	// <---REMAINDER BLOCK ASSIGNMENTS---> <------------ num_next_pass_ext_block_count FULL BLOCK ASSIGNMENTS ------------------->
-	// [0,1,..,num_next_pass_ext_buckets-1,num_next_pass_ext_buckets,...,num_next_pass_ext_block_count+num_next_pass_ext_buckets-1]
-	unsigned int full_block_offset = num_next_pass_ext_buckets;
-
-	// Prepare one assignment for each single block involved in processing the counting sort for one of the buckets
-//	START_CPU_TIMER(1, bm_cpu_genass);
-//	printf("START\n");
-	for(unsigned int i=0; i < num_next_pass_ext_buckets; i++){
-		SubBucketInfo tmp;
-		tmp = extsrt_in_bin_info[i];
-		unsigned int bin_offset = tmp.offset;
-//		printf("next pass bucket %5d (id, offset, size): %u, %u, %u\n", i, tmp.bin_idx, tmp.offset, tmp.block_num_elements);
-//		printf("%u, %u, %u\n", tmp.bin_idx, tmp.offset, tmp.block_num_elements);
-		for(unsigned int j=0; tmp.block_num_elements > 0; j++){
-			// Another full block
-			if(tmp.block_num_elements >= max_ext_srt_kpb){
-				extsrt_blck_to_in_bin_assignments[full_block_offset+num_next_pass_ext_block_count].bin_idx = tmp.bin_idx;
-				extsrt_blck_to_in_bin_assignments[full_block_offset+num_next_pass_ext_block_count].offset = tmp.offset;
-				extsrt_blck_to_in_bin_assignments[full_block_offset+num_next_pass_ext_block_count].bin_start_offset = bin_offset;
-				extsrt_blck_to_in_bin_assignments[full_block_offset+num_next_pass_ext_block_count].block_num_elements = max_ext_srt_kpb;
-
-				tmp.offset += extsrt_blck_to_in_bin_assignments[full_block_offset+num_next_pass_ext_block_count].block_num_elements;
-				tmp.block_num_elements -= extsrt_blck_to_in_bin_assignments[full_block_offset+num_next_pass_ext_block_count].block_num_elements;
-				num_next_pass_ext_block_count++;
-			}
-			// The remainder block of that bucket
-			else{
-				extsrt_blck_to_in_bin_assignments[num_extsrt_remainder_block_count].bin_idx = tmp.bin_idx;
-				extsrt_blck_to_in_bin_assignments[num_extsrt_remainder_block_count].offset = tmp.offset;
-				extsrt_blck_to_in_bin_assignments[num_extsrt_remainder_block_count].bin_start_offset = bin_offset;
-				extsrt_blck_to_in_bin_assignments[num_extsrt_remainder_block_count].block_num_elements = tmp.block_num_elements > max_ext_srt_kpb ? max_ext_srt_kpb : tmp.block_num_elements;
-
-				tmp.offset += extsrt_blck_to_in_bin_assignments[num_extsrt_remainder_block_count].block_num_elements;
-				tmp.block_num_elements -= extsrt_blck_to_in_bin_assignments[num_extsrt_remainder_block_count].block_num_elements;
-				num_extsrt_remainder_block_count++;
-			}
-		}
-	}
-//	printf("END\n");
-//	STOP_CPU_TIMER(bm_cpu_genass, "CPU prepare block assignments: ");
-
-	struct extsrt_assignment_info_t tmp;
-	tmp.num_ext_bins = num_next_pass_ext_buckets;
-	tmp.num_extsrt_block_count = num_next_pass_ext_block_count;
-	tmp.num_extsrt_remainder_block_count = num_extsrt_remainder_block_count;
-	tmp.extsrt_full_block_offset = full_block_offset;
-	return tmp;
-}
+void rdxsrt_prepare_histograms(unsigned int *dev_histo, unsigned int num_ext_in_bins, cudaStream_t cstream);
+struct extsrt_assignment_info_t generate_next_pass_block_assignments(const unsigned int *dev_atomic_extsrt_bucket_counter, const SubBucketInfo *dev_extsrt_in_bin_info, SubBucketInfo *extsrt_in_bin_info,  struct rdxsrt_extsrt_block_to_bin_t *extsrt_blck_to_in_bin_assignments, unsigned int max_ext_srt_kpb, cudaStream_t cstream, cudaEvent_t offst_comp_event);
 
 template <
 	typename KeyT,						// Key type
@@ -302,7 +207,7 @@ RDXSRT_SortedSequence<KeyT, ValueT> rdxsrt_unstable_sort(KeyT *dev_keys, ValueT 
 	const unsigned int NUM_PASSES = NUM_KEY_PASSES + NUM_LSB_IN_VAL_PASSES;
 	const int KPB = TPB * KPT;	// Keys per block (for ext-sort)
 
-	//BM_START_CPU_PROFILE(sort configs, sort_configs);
+	BM_START_CPU_PROFILE(sort configs, sort_configs);
 	/**** PREPARE LOCAL SORT CONFIGURATIONS ****/
 	if(!local_sort_configurations){
 //		printf("Getting default local sort configs\n");
@@ -352,16 +257,16 @@ RDXSRT_SortedSequence<KeyT, ValueT> rdxsrt_unstable_sort(KeyT *dev_keys, ValueT 
 	/*** PREPARE CUDA STREAMS ***/
 
 	/*** START PROCESSING BENCHMARK ***/
-	//BM_START_CUDA_EVENT(sort processing, sort_proc, cstrm_extsrt);
+	BM_START_CUDA_EVENT(sort processing, sort_proc, cstrm_extsrt);
 	/*** START PROCESSING BENCHMARK ***/
 
 	/*** INITIALIZE COUNTERS ***/
 	cudaMemsetAsync(dm->bucket_counters, 0, dm->max_counter_mem, cstrm_extsrt);
 
-	//BM_DECLARE_METRIC_ARRAY(histo, histo, 0, 8);
-	//BM_DECLARE_METRIC_ARRAY(pfx_sum, pfx_sum, 0, 8);
-	//BM_DECLARE_METRIC_ARRAY(scatter, scatter, 0, 8);
-	//BM_DECLARE_METRIC_ARRAY(local_sort, local_sort, 0, 8);
+	BM_DECLARE_METRIC_ARRAY(histo, histo, 0, 8);
+	BM_DECLARE_METRIC_ARRAY(pfx_sum, pfx_sum, 0, 8);
+	BM_DECLARE_METRIC_ARRAY(scatter, scatter, 0, 8);
+	BM_DECLARE_METRIC_ARRAY(local_sort, local_sort, 0, 8);
 
 	/***************************
 	 ***************************
@@ -370,18 +275,18 @@ RDXSRT_SortedSequence<KeyT, ValueT> rdxsrt_unstable_sort(KeyT *dev_keys, ValueT 
 	 ***************************/
 
 	/********* HISTOGRAM PASS 0 *********/
-	//BM_START_CUDA_ARRAY_EVENT_LEV(1, histo, histo, cstrm_extsrt, 0, 8);
+	BM_START_CUDA_ARRAY_EVENT_LEV(1, histo, histo, cstrm_extsrt, 0, 8);
 	rdxsrt_prepare_histograms(dm->dev_histogram, 1, cstrm_extsrt);
 	rdxsrt_histogram<KeyT, IndexT, DIGIT_BITS, KPT, TPB, 9, true><<<num_blocks, TPB, 0, cstrm_extsrt>>>(dev_keys, NULL, 0, dm->dev_histogram, dm->dev_per_block_histogram);
 	if(remaining_elements > 0){
 		rdxsrt_histogram_with_guards<KeyT, IndexT, DIGIT_BITS, KPT, TPB, 9, true><<<remainder_blocks, TPB, 0, cstrm_extsrt>>>(dev_keys, NULL, 0, dm->dev_histogram, dm->dev_per_block_histogram, key_count, num_blocks);
 	}
-	//BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, histo, histo, cstrm_extsrt, 0, 8);
+	BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, histo, histo, cstrm_extsrt, 0, 8);
 //	rdxsrt_histogram_with_guards<KeyT, IndexT, DIGIT_BITS, KPT, TPB, 9, true><<<num_blocks+remainder_blocks, TPB, 0, cstrm_extsrt>>>(dev_keys, NULL, 0, dm->dev_histogram, dm->dev_per_block_histogram, key_count, 0);
 	/********* HISTOGRAM PASS 0 *********/
 
 	/********* COMPUTE OFFSETS OF OUT-BINS PASS 0 AND ASSIGNMENTS OF PASS 1 *********/
-	//BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, pfx_sum, pfx_sum, cstrm_extsrt, 0, 8);
+	BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, pfx_sum, pfx_sum, cstrm_extsrt, 0, 8);
 	// Prepare assignment for the only IN-bin in the first pass
 	dm->nl_bucket_info_buffer[0] = (SubBucketInfo){0};
 	cudaMemcpyAsync(dm->dev_nl_bucket_info, dm->nl_bucket_info_buffer, 1 * sizeof(SubBucketInfo), cudaMemcpyHostToDevice, cstrm_extsrt);
@@ -432,10 +337,10 @@ RDXSRT_SortedSequence<KeyT, ValueT> rdxsrt_unstable_sort(KeyT *dev_keys, ValueT 
 	#endif
 
 	cudaEventRecord(cstrm_nxtp_assignment_compl[0], cstrm_extsrt);
-	//BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, pfx_sum, pfx_sum, cstrm_extsrt, 0, 8);
+	BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, pfx_sum, pfx_sum, cstrm_extsrt, 0, 8);
 	/********* COMPUTE OFFSETS OF OUT-BINS PASS 0 AND ASSIGNMENTS OF PASS 1 *********/
 	/********* PERFORM ACTUAL PASS 0 SORTING *********/
-	//BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, scatter, scatter, cstrm_extsrt, 0, 8);
+	BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, scatter, scatter, cstrm_extsrt, 0, 8);
 	if(NUM_PASSES==1){
 		// Needs to twiddle in-out in a single pass
 		// TODO
@@ -447,7 +352,7 @@ RDXSRT_SortedSequence<KeyT, ValueT> rdxsrt_unstable_sort(KeyT *dev_keys, ValueT 
 //		rdxsrt_partition_keys_with_guards<KeyT, ValueT, IndexT, DIGIT_BITS, KPT, TPB, 9, true, false><<<num_blocks+remainder_blocks, TPB, 0, cstrm_extsrt>>>(dev_keys, dev_values, NULL, 0, dm->dev_subbucket_offsets, dm->dev_per_block_histogram, key_count, 0, dev_sorted_keys_out, dev_sorted_values_out);
 	}
 	cudaEventRecord(cstrm_lastp_nlsort_compl[0], cstrm_extsrt);
-	//BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, scatter, scatter, cstrm_extsrt, 0, 8);
+	BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, scatter, scatter, cstrm_extsrt, 0, 8);
 	/********* PERFORM ACTUAL PASS 0 SORTING *********/
 
 	unsigned int num_current_pass_ext_bins;
@@ -481,7 +386,7 @@ RDXSRT_SortedSequence<KeyT, ValueT> rdxsrt_unstable_sort(KeyT *dev_keys, ValueT 
 		cudaMemcpyAsync(&num_locrec_blocks[0], &(dm->bucket_counters[pass-1].dev_local_bucket_counter[0]), sizeof(num_locrec_blocks), cudaMemcpyDeviceToHost, cstrm_lsort);
 		cudaStreamSynchronize(cstrm_lsort);
 		cudaStreamWaitEvent(cstrm_lsort, cstrm_lastp_nlsort_compl[pass-1], 0);
-		//BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, local_sort, local_sort, cstrm_lsort, pass, 8);
+		BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, local_sort, local_sort, cstrm_lsort, pass, 8);
 		unsigned int locrec_assnmt_offset = 0;
 		for(int i=0; i < num_local_sort_cfgs; i++){
 			// Skip local sort configurations that won't work on any blocks
@@ -496,7 +401,7 @@ RDXSRT_SortedSequence<KeyT, ValueT> rdxsrt_unstable_sort(KeyT *dev_keys, ValueT 
 			kernel_ptr<<<num_locrec_blocks[i], local_sort_configurations->sort_configs[i]->tpb, 0, cstrm_lsort>>>(dev_keys, dev_values, dm->dev_local_bucket_info + locrec_assnmt_offset, pass, dev_final_sorted_keys_out, dev_final_sorted_values_out);
 			locrec_assnmt_offset += num_locrec_blocks[i];
 		}
-		//BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, local_sort, local_sort, cstrm_lsort, pass, 8);
+		BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, local_sort, local_sort, cstrm_lsort, pass, 8);
 		cudaEventRecord(cstrm_local_sort_compl[pass], cstrm_lsort);
 		/********* LOCREC SORT PASS N *********/
 
@@ -519,25 +424,25 @@ RDXSRT_SortedSequence<KeyT, ValueT> rdxsrt_unstable_sort(KeyT *dev_keys, ValueT 
 			/********* HISTOGRAM PASS N *********/
 			// Copy block assignments that have been prepared on the CPU
 			cudaMemcpyAsync(dm->dev_nl_block_assignments, dm->nl_block_assignments, (tmp.num_extsrt_block_count+tmp.extsrt_full_block_offset) * sizeof(*dm->dev_nl_block_assignments), cudaMemcpyHostToDevice, cstrm_extsrt);
-			//BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, histo, histo, cstrm_extsrt, pass, 8);
+			BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, histo, histo, cstrm_extsrt, pass, 8);
 			rdxsrt_prepare_histograms(dm->dev_histogram, num_current_pass_ext_bins, cstrm_extsrt);
 			if(tmp.num_extsrt_block_count > 0)
 				rdxsrt_histogram<KeyT, IndexT, DIGIT_BITS, KPT, TPB, 9, false><<<tmp.num_extsrt_block_count, TPB, 0, cstrm_extsrt>>>(dev_keys, dm->dev_nl_block_assignments+tmp.extsrt_full_block_offset, PASS_BYTE, dm->dev_histogram, dm->dev_per_block_histogram);
 			if(tmp.num_extsrt_remainder_block_count > 0){
 				rdxsrt_histogram_with_guards<KeyT, IndexT, DIGIT_BITS, KPT, TPB, 9, false><<<tmp.num_extsrt_remainder_block_count, TPB, 0, cstrm_extsrt>>>(dev_keys, dm->dev_nl_block_assignments, PASS_BYTE, dm->dev_histogram, dm->dev_per_block_histogram, key_count, tmp.num_extsrt_block_count);
 			}
-			//BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, histo, histo, cstrm_extsrt, pass, 8);
+			BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, histo, histo, cstrm_extsrt, pass, 8);
 			/********* HISTOGRAM PASS M *********/
 
 			/********* COMPUTE OFFSETS OF OUT-BINS PASS N AND ASSIGNMENTS OF PASS N+1 *********/
 			// Compute current pass out-bin offsets and next pass' block assignments
 			if(pass == NUM_PASSES-1){
-				//BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, pfx_sum, pfx_sum, cstrm_extsrt, pass, 8);
+				BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, pfx_sum, pfx_sum, cstrm_extsrt, pass, 8);
 				do_fast_merged_compute_subbin_offsets_and_segmented_next_pass_assignments<IndexT, RADIX, 8, 128, RDXSRT_MAX_NUM_SORT_CONFIGS, RDXSRT_CFG_MERGE_LOCREC_THRESH, false><<<num_current_pass_ext_bins, 128, 0, cstrm_extsrt>>>(dm->dev_histogram, dm->dev_nl_bucket_info, dm->dev_subbucket_offsets, &dm->bucket_counters[pass].dev_nl_bucket_counter, dm->dev_nl_subbucket_info, &(dm->bucket_counters[pass].dev_local_cfg_offsets[0]), dm->dev_local_bucket_info, dev_locrec_distinctions, num_local_sort_cfgs);
-				//BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, pfx_sum, pfx_sum, cstrm_extsrt, pass, 8);
+				BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, pfx_sum, pfx_sum, cstrm_extsrt, pass, 8);
 			}else{
 				cudaStreamWaitEvent(cstrm_extsrt, cstrm_local_sort_compl[pass], 0);
-				//BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, pfx_sum, pfx_sum, cstrm_extsrt, pass, 8);
+				BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, pfx_sum, pfx_sum, cstrm_extsrt, pass, 8);
 //				cudaStreamSynchronize(cstrm_lsort);
 				#if RDXSRT_CFG_MERGE_LOCREC_THRESH
 				do_fast_merged_compute_subbin_offsets_and_segmented_next_pass_assignments<IndexT, RADIX, 8, 128, RDXSRT_MAX_NUM_SORT_CONFIGS, RDXSRT_CFG_MERGE_LOCREC_THRESH, true, true><<<num_current_pass_ext_bins, 128, 0, cstrm_extsrt>>>(dm->dev_histogram, dm->dev_nl_bucket_info, dm->dev_subbucket_offsets, &dm->bucket_counters[pass].dev_nl_bucket_counter, dm->dev_nl_subbucket_info, &(dm->bucket_counters[pass].dev_local_bucket_counter[0]), dm->dev_local_bucket_info, dev_locrec_distinctions, num_local_sort_cfgs);
@@ -548,14 +453,14 @@ RDXSRT_SortedSequence<KeyT, ValueT> rdxsrt_unstable_sort(KeyT *dev_keys, ValueT 
 				do_compute_locrec_segmented_assignment_offsets<<<32,1, 0, cstrm_extsrt>>>(&(dm->bucket_counters[pass].dev_local_bucket_counter[0]), &(dm->bucket_counters[pass].dev_local_cfg_offsets[0]));
 				do_compute_subbin_offsets_and_segmented_next_pass_assignments<RDXSRT_MAX_NUM_SORT_CONFIGS><<<num_current_pass_ext_bins, RADIX, 0, cstrm_extsrt>>>(dm->dev_histogram, dm->dev_nl_bucket_info, dm->dev_subbucket_offsets, &dm->bucket_counters[pass].dev_nl_bucket_counter, dm->dev_nl_subbucket_info, &(dm->bucket_counters[pass].dev_local_cfg_offsets[0]), dm->dev_local_bucket_info, dev_locrec_distinctions, num_local_sort_cfgs);
 				#endif
-				//BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, pfx_sum, pfx_sum, cstrm_extsrt, pass, 8);
+				BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, pfx_sum, pfx_sum, cstrm_extsrt, pass, 8);
 			}
 			cudaEventRecord(cstrm_nxtp_assignment_compl[pass], cstrm_extsrt);
 			/********* COMPUTE OFFSETS OF OUT-BINS PASS N AND ASSIGNMENTS OF PASS N+1 *********/
 
 			/********* PERFORM ACTUAL PASS N SORTING *********/
 
-			//BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, scatter, scatter, cstrm_extsrt, pass, 8);
+			BM_START_CUDA_ARRAY_EVENT_LEV(DBG_LEV, scatter, scatter, cstrm_extsrt, pass, 8);
 			if(tmp.num_extsrt_block_count > 0)
 				if(pass == NUM_PASSES-1)
 					rdxsrt_partition_keys<KeyT, ValueT, IndexT, DIGIT_BITS, KPT, TPB, 9, false, true><<<tmp.num_extsrt_block_count, TPB, 0, cstrm_extsrt>>>(dev_keys, dev_values, dm->dev_nl_block_assignments+tmp.extsrt_full_block_offset, PASS_BYTE, dm->dev_subbucket_offsets, dm->dev_per_block_histogram, dev_sorted_keys_out, dev_sorted_values_out);
@@ -566,7 +471,7 @@ RDXSRT_SortedSequence<KeyT, ValueT> rdxsrt_unstable_sort(KeyT *dev_keys, ValueT 
 					rdxsrt_partition_keys_with_guards<KeyT, ValueT, IndexT, DIGIT_BITS, KPT, TPB, 9, false, true><<<tmp.num_extsrt_remainder_block_count, TPB, 0, cstrm_extsrt>>>(dev_keys, dev_values, dm->dev_nl_block_assignments, PASS_BYTE, dm->dev_subbucket_offsets, dm->dev_per_block_histogram, key_count, tmp.num_extsrt_block_count, dev_sorted_keys_out, dev_sorted_values_out);
 				else
 					rdxsrt_partition_keys_with_guards<KeyT, ValueT, IndexT, DIGIT_BITS, KPT, TPB, 9, false, false><<<tmp.num_extsrt_remainder_block_count, TPB, 0, cstrm_extsrt>>>(dev_keys, dev_values, dm->dev_nl_block_assignments, PASS_BYTE, dm->dev_subbucket_offsets, dm->dev_per_block_histogram, key_count, tmp.num_extsrt_block_count, dev_sorted_keys_out, dev_sorted_values_out);
-			//BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, scatter, scatter, cstrm_extsrt, pass, 8);
+			BM_STOP_CUDA_ARRAY_EVENT_LEV(DBG_LEV, scatter, scatter, cstrm_extsrt, pass, 8);
 			cudaEventRecord(cstrm_lastp_nlsort_compl[pass], cstrm_extsrt);
 
 			if(IS_VAL_PASS){
@@ -584,8 +489,8 @@ RDXSRT_SortedSequence<KeyT, ValueT> rdxsrt_unstable_sort(KeyT *dev_keys, ValueT 
 	cudaStreamSynchronize(cstrm_extsrt);
 	cudaStreamSynchronize(cstrm_prep_nxtp);
 	cudaStreamSynchronize(cstrm_lsort);
-	//BM_STOP_CUDA_EVENT(sort processing, sort_proc, cstrm_extsrt);
-	//BM_STOP_CPU_PROFILE(sort configs, sort_configs);
+	BM_STOP_CUDA_EVENT(sort processing, sort_proc, cstrm_extsrt);
+	BM_STOP_CPU_PROFILE(sort configs, sort_configs);
 
 	if(own_extstrt_stream)
 		cudaStreamDestroy(cstrm_extsrt);
@@ -606,29 +511,29 @@ template <typename KeyT>
 void rdxsrt_unstable_sort_keys(KeyT *keys, const unsigned long long int key_count, KeyT *sorted_keys_out)
 {
 	/*** KEY ALLOCATION ***/
-	//BM_START_CUDA_EVENT(memcpy H2D, memcpyhtd,NULL);
+	BM_START_CUDA_EVENT(memcpy H2D, memcpyhtd,NULL);
 	KeyT *dev_keys, *dev_keys_out;
 	// Allocate device memory for the sorted keys
 	cudaMalloc((void **)&dev_keys_out, sizeof(*dev_keys_out) * key_count);
 	// Allocate device memory for the input keys and copy keys there
 	cudaMalloc((void **)&dev_keys, sizeof(*dev_keys) * key_count);
 	cudaMemcpy(dev_keys, keys, sizeof(*dev_keys) * key_count, cudaMemcpyHostToDevice);
-	//BM_STOP_CUDA_EVENT(memcpy H2D, memcpyhtd, NULL);
+	BM_STOP_CUDA_EVENT(memcpy H2D, memcpyhtd, NULL);
 
 	/*** Trigger key sorting according to the most significant byte ***/
-	//START_CUDA_TIMER(1, bm_whole, NULL);
-	//BM_START_CUDA_EVENT(full sort, full_sort, NULL);
+	START_CUDA_TIMER(1, bm_whole, NULL);
+	BM_START_CUDA_EVENT(full sort, full_sort, NULL);
 //	if(key_count>UINT_MAX)
 //		rdxsrt_unstable_sort<KeyT, KeyT, unsigned long long int>(dev_keys, NULL, key_count, dev_keys_out, NULL);
 //	else
 		rdxsrt_unstable_sort<KeyT, cub::NullType, unsigned int>(dev_keys, NULL, key_count, dev_keys_out, NULL);
-	//BM_STOP_CUDA_EVENT(full sort, full_sort, NULL);
-	//STOP_CUDA_TIMER(bm_whole, "Whole radix sort...");
+	BM_STOP_CUDA_EVENT(full sort, full_sort, NULL);
+	STOP_CUDA_TIMER(bm_whole, "Whole radix sort...");
 
 	/*** Copy back sorted keys ***/
-	//BM_START_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
+	BM_START_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
 	cudaMemcpy(sorted_keys_out, dev_keys, sizeof(*dev_keys) * key_count, cudaMemcpyDeviceToHost);
-	//BM_STOP_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
+	BM_STOP_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
 
 	/*** Free memory ***/
 	cudaFree(dev_keys);
@@ -640,7 +545,7 @@ void rdxsrt_unstable_sort_pairs(KeyT *keys, ValueT *values, const unsigned long 
 {
 	// Start performance measurement
 	/*** KEY ALLOCATION ***/
-	//BM_START_CUDA_EVENT(memcpy H2D, memcpyhtd,NULL);
+	BM_START_CUDA_EVENT(memcpy H2D, memcpyhtd,NULL);
 	KeyT *dev_keys, *dev_keys_out;
 	// Allocate device memory for the sorted keys
 	cudaMalloc((void **)&dev_keys_out, sizeof(*dev_keys_out) * key_count);
@@ -656,23 +561,23 @@ void rdxsrt_unstable_sort_pairs(KeyT *keys, ValueT *values, const unsigned long 
 	// Allocate device memory for the input keys and copy keys there
 	cudaMalloc((void **)&dev_values, sizeof(*dev_values) * key_count);
 	cudaMemcpy(dev_values, values, sizeof(*dev_values) * key_count, cudaMemcpyHostToDevice);
-	//BM_STOP_CUDA_EVENT(memcpy H2D, memcpyhtd, NULL);
+	BM_STOP_CUDA_EVENT(memcpy H2D, memcpyhtd, NULL);
 	/*** VALUE ALLOCATION ***/
 
 	/*** Trigger key sorting according to the most significant byte ***/
-	//START_CUDA_TIMER(1, bm_whole, NULL);
-	//BM_START_CUDA_EVENT(full sort, full_sort, NULL);
+	START_CUDA_TIMER(1, bm_whole, NULL);
+	BM_START_CUDA_EVENT(full sort, full_sort, NULL);
 	rdxsrt_unstable_sort<KeyT, ValueT, unsigned int>(dev_keys, dev_values, key_count, dev_keys_out, dev_values_out, local_sort_config_set);
-	//BM_STOP_CUDA_EVENT(full sort, full_sort, NULL);
-	//STOP_CUDA_TIMER(bm_whole, "Whole radix sort...");
+	BM_STOP_CUDA_EVENT(full sort, full_sort, NULL);
+	STOP_CUDA_TIMER(bm_whole, "Whole radix sort...");
 
 	/*** Copy back sorted keys ***/
-	//BM_START_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
+	BM_START_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
 	cudaMemcpy(sorted_keys_out, dev_keys, sizeof(*dev_keys) * key_count, cudaMemcpyDeviceToHost);
 
 	/*** Copy back sorted values ***/
 	cudaMemcpy(sorted_values_out, dev_values, sizeof(*dev_values) * key_count, cudaMemcpyDeviceToHost);
-	//BM_STOP_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
+	BM_STOP_CUDA_EVENT(memcpy D2H, memcpydth,NULL);
 
 	/*** Free memory ***/
 	cudaFree(dev_keys);

@@ -31,7 +31,7 @@ int main(int argc, char **argv)
 	cudaSetDevice(selected_device);
 	cudaDeviceProp deviceProp;
 	cudaGetDeviceProperties(&deviceProp, selected_device);
-	printf(" -> Selected device %d (%s) has %d SMs (shared memory: %zu B, registers: %6d) @%d MHz, memory-bus: %d bit @%d MHz (%d GB/s). \n", device, deviceProp.name, deviceProp.multiProcessorCount, deviceProp.sharedMemPerMultiprocessor, deviceProp.regsPerMultiprocessor, deviceProp.clockRate/1000, deviceProp.memoryBusWidth, deviceProp.memoryClockRate/1000, deviceProp.memoryBusWidth/8*(deviceProp.memoryClockRate)*2/1000000);
+	printf(" -> Selected device %d (%s) has %d SMs (shared memory: %zu B, registers: %6d) @%d MHz, memory-bus: %d bit @%d MHz (%d GB/s). \n", selected_device, deviceProp.name, deviceProp.multiProcessorCount, deviceProp.sharedMemPerMultiprocessor, deviceProp.regsPerMultiprocessor, deviceProp.clockRate/1000, deviceProp.memoryBusWidth, deviceProp.memoryClockRate/1000, deviceProp.memoryBusWidth/8*(deviceProp.memoryClockRate)*2/1000000);
 	print_gpu_info();
 
 	/******************************
